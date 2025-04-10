@@ -1,4 +1,3 @@
-```python
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -412,18 +411,101 @@ def main(model_path):
             last_hand_centers[1] = None
 
         elif interaction_mode == "SCALE" and num_hands == 2:
-             # Use distance between index finger tips (landmark 8)
-             try:
-                 index_tip1 = detected_hands[0]["landmarks"][8]
-                 index_tip2 = detected_hands[1]["landmarks"][8]
-                 current_pinch_distance = calculate_2d_distance(index_tip1, index_tip2)
+            # Use distance between index finger tips (landmark 8)
+            try:
+                index_tip1 = detected_hands[0]["landmarks"][8]
+                index_tip2 = detected_hands[1]["landmarks"][8]
+                current_pinch_distance = calculate_2d_distance(index_tip1, index_tip2)
 
-                 if initial_pinch_distance is None:
-                     initial_pinch_distance = current_pinch_distance # Capture starting distance
-                 elif initial_pinch_distance > 1e-6: # Avoid division by zero
-                     scale_factor_change = current_pinch_distance / initial_pinch_distance
-                     # Apply scale change relative to the *start* of the gesture
-                     # Calculate delta scale to apply smoothly
-                     target_scale = DEFAULT_MODEL_SCALE * scale_factor_change # This assumes DEFAULT_MODEL_SCALE was the scale when gesture started - needs refinement
-                     # Let's apply delta scale instead:
-                     scale_
+                if initial_pinch_distance is None:
+                    initial_pinch_distance = current_pinch_distance # Capture starting distance
+                elif initial_pinch_distance > 1e-6: # Avoid division by zero
+                    scale_factor_change = current_pinch_distance / initial_pinch_distance
+                    # Apply smooth scaling with a limit to prevent sudden jumps
+                    scale_change_clamped = max(0.8, min(1.2, scale_factor_change))  # Limit to 20% change per frame
+                    model_scale *= scale_change_clamped
+                    
+                    # Keep scale within reasonable bounds
+                    model_scale = max(0.1, min(10.0, model_scale))
+                    
+                    # Update initial distance for next frame (smooths movement)
+                    initial_pinch_distance = current_pinch_distance
+            except (IndexError, KeyError) as e:
+                print(f"Error in SCALE mode: {e}")
+                
+            last_hand_centers[0] = current_hand_centers[0]
+            last_hand_centers[1] = current_hand_centers[1]
+
+        # --- Render OpenGL Scene ---
+        # Create the 3D visualization using OpenGL
+        gl_frame = render_gl_scene(actual_width, actual_height, scene)
+        
+        # Combine camera feed and OpenGL rendering
+        # Use alpha blending for a semi-transparent overlay effect
+        alpha = 0.7  # OpenGL visualization opacity
+        beta = 1.0 - alpha  # Camera feed opacity
+        
+        # Resize frames if dimensions don't match
+        if gl_frame.shape != frame.shape:
+            gl_frame = cv2.resize(gl_frame, (frame.shape[1], frame.shape[0]))
+        
+        # Overlay the GL visualization on the camera feed
+        combined_frame = cv2.addWeighted(frame, beta, gl_frame, alpha, 0)
+
+        # --- Draw UI Elements ---
+        # Draw mode indicator
+        mode_text = f"Mode: {interaction_mode}"
+        cv2.putText(combined_frame, mode_text, (20, 30), UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
+        
+        # Draw FPS counter
+        fps_text = f"FPS: {fps:.1f}"
+        cv2.putText(combined_frame, fps_text, (20, 60), UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
+        
+        # Draw transformation values
+        trans_text = f"Position: X={model_translation[0]:.1f} Y={model_translation[1]:.1f} Z={model_translation[2]:.1f}"
+        cv2.putText(combined_frame, trans_text, (20, actual_height - 90), UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
+        
+        rot_text = f"Rotation: X={model_rotation[0]:.1f} Y={model_rotation[1]:.1f} Z={model_rotation[2]:.1f}"
+        cv2.putText(combined_frame, rot_text, (20, actual_height - 60), UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
+        
+        scale_text = f"Scale: {model_scale:.2f}"
+        cv2.putText(combined_frame, scale_text, (20, actual_height - 30), UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
+        
+        # Show controls help
+        controls_text = "Controls: Open hand=Move | Fist=Rotate | Two hands=Scale | ESC=Exit"
+        cv2.putText(combined_frame, controls_text, 
+                    (int(actual_width/2) - 300, actual_height - 30), 
+                    UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
+
+        # Show the combined frame
+        cv2.imshow(WINDOW_NAME, combined_frame)
+        
+        # Check for keyboard input
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:  # ESC key
+            print("ESC pressed. Exiting...")
+            break
+        elif key == ord('r'):  # Reset transformations
+            model_translation = [0.0, 0.0, -5.0]
+            model_rotation = [0.0, 0.0, 0.0]
+            model_scale = DEFAULT_MODEL_SCALE
+            print("Transformations reset.")
+
+    # --- Cleanup ---
+    hands.close()
+    cap.release()
+    cv2.destroyAllWindows()
+    print("AetherManipulator terminated.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="AetherManipulator - Manipulate 3D models with hand gestures")
+    parser.add_argument("model_path", type=str, help="Path to OBJ model file")
+    parser.add_argument("--scale", type=float, default=DEFAULT_MODEL_SCALE, help=f"Initial model scale (default: {DEFAULT_MODEL_SCALE})")
+    
+    args = parser.parse_args()
+    
+    # Set initial scale if provided
+    DEFAULT_MODEL_SCALE = args.scale
+    model_scale = DEFAULT_MODEL_SCALE
+    
+    main(args.model_path)
