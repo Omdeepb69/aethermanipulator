@@ -6,63 +6,173 @@ import argparse
 import os
 import sys
 import time
-
+from ctypes import byref, c_int, CDLL, c_void_p
+from OpenGL.GL import *
+from OpenGL.GLU import *
+from OpenGL.GLUT import *
+import pywavefront
+import trimesh
 try:
-    from OpenGL.GL import *
-    from OpenGL.GLU import *
-    # PyOpenGL_accelerate is implicitly used if installed
+    import pymeshlab
 except ImportError:
-    print("ERROR: PyOpenGL or PyOpenGL_accelerate not installed.")
-    print("Please install them:")
-    print("pip install PyOpenGL PyOpenGL_accelerate")
-    sys.exit(1)
+    pymeshlab = None
 
-try:
-    import pywavefront
-except ImportError:
-    print("ERROR: pywavefront not installed.")
-    print("Please install it:")
-    print("pip install pywavefront")
-    sys.exit(1)
-
-# --- Configuration ---
+# Constants
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
 WINDOW_NAME = "AetherManipulator"
 DEFAULT_MODEL_SCALE = 1.0
-MODEL_ROTATION_SPEED = 0.8
-MODEL_TRANSLATION_SPEED = 1.5
-MODEL_SCALE_SPEED = 0.05
-UI_COLOR = (0, 200, 0) # Green
+MODEL_ROTATION_SPEED = 1.2
+MODEL_TRANSLATION_SPEED = 2.0
+MODEL_SCALE_SPEED = 0.08
+UI_COLOR = (0, 255, 0)
 UI_FONT = cv2.FONT_HERSHEY_SIMPLEX
 UI_SCALE = 0.7
 UI_THICKNESS = 2
 
-# --- Global State ---
-interaction_mode = "TRANSLATE" # TRANSLATE, ROTATE, SCALE
-model_translation = [0.0, 0.0, -5.0] # Initial translation (X, Y, Z)
-model_rotation = [0.0, 0.0, 0.0] # Initial rotation (X, Y, Z degrees)
+# Global state
+interaction_mode = "TRANSLATE"
+model_translation = [0.0, 0.0, -5.0]
+model_rotation = [0.0, 0.0, 0.0]
 model_scale = DEFAULT_MODEL_SCALE
+model_type = None
+model_meshes = None
+model_materials = None
+last_hand_centers = [None, None]
+initial_pinch_distance = None
+last_gesture_time = 0
+gesture_lock = False
+gl_context_created = False
+gl_window_id = None
 
-# Hand tracking state
-last_hand_centers = [None, None] # Store center positions for delta calculations (index 0 for first hand, 1 for second)
-initial_pinch_distance = None # For scaling
-last_gesture_time = 0 # Debounce gestures
+def initialize_glut():
+    global gl_context_created, gl_window_id
+    try:
+        if not gl_context_created:
+            # Try loading freeglut from local directory first
+            if os.name == 'nt':
+                freeglut_path = os.path.join(os.path.dirname(__file__), 'freeglut.dll')
+                if os.path.exists(freeglut_path):
+                    try:
+                        CDLL(freeglut_path)
+                    except Exception as e:
+                        print(f"Warning: Could not load freeglut.dll: {e}")
+            
+            # Then try system-wide installation
+            glutInit(sys.argv if hasattr(sys, 'argv') else [b''])
+            glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE | GLUT_DEPTH)
+            glutInitWindowSize(WINDOW_WIDTH, WINDOW_HEIGHT)
+            glutInitWindowPosition(0, 0)
+            gl_window_id = glutCreateWindow(b"AetherManipulator")
+            gl_context_created = True
+            init_opengl(WINDOW_WIDTH, WINDOW_HEIGHT)
+        return True
+    except Exception as e:
+        print(f"GLUT initialization failed: {e}")
+        print("Attempting alternative OpenGL context creation...")
+        return create_alternative_opengl_context()
 
-# --- OpenGL Rendering ---
-scene = None
-light_ambient = [0.2, 0.2, 0.2, 1.0]
-light_diffuse = [0.8, 0.8, 0.8, 1.0]
-light_specular = [0.5, 0.5, 0.5, 1.0]
-light_position = [2.0, 2.0, 5.0, 1.0] # Positional light
+def create_alternative_opengl_context():
+    global gl_context_created
+    try:
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+            
+            # Windows-specific OpenGL context creation
+            user32 = ctypes.WinDLL('user32', use_last_error=True)
+            gdi32 = ctypes.WinDLL('gdi32', use_last_error=True)
+            
+            # Define necessary types and constants
+            PIXELFORMATDESCRIPTOR = type('PIXELFORMATDESCRIPTOR', (ctypes.Structure,), {
+                '_fields_': [
+                    ('nSize', wintypes.WORD),
+                    ('nVersion', wintypes.WORD),
+                    ('dwFlags', wintypes.DWORD),
+                    ('iPixelType', ctypes.c_byte),
+                    ('cColorBits', ctypes.c_byte),
+                    ('cRedBits', ctypes.c_byte),
+                    ('cRedShift', ctypes.c_byte),
+                    ('cGreenBits', ctypes.c_byte),
+                    ('cGreenShift', ctypes.c_byte),
+                    ('cBlueBits', ctypes.c_byte),
+                    ('cBlueShift', ctypes.c_byte),
+                    ('cAlphaBits', ctypes.c_byte),
+                    ('cAlphaShift', ctypes.c_byte),
+                    ('cAccumBits', ctypes.c_byte),
+                    ('cAccumRedBits', ctypes.c_byte),
+                    ('cAccumGreenBits', ctypes.c_byte),
+                    ('cAccumBlueBits', ctypes.c_byte),
+                    ('cAccumAlphaBits', ctypes.c_byte),
+                    ('cDepthBits', ctypes.c_byte),
+                    ('cStencilBits', ctypes.c_byte),
+                    ('cAuxBuffers', ctypes.c_byte),
+                    ('iLayerType', ctypes.c_byte),
+                    ('bReserved', ctypes.c_byte),
+                    ('dwLayerMask', wintypes.DWORD),
+                    ('dwVisibleMask', wintypes.DWORD),
+                    ('dwDamageMask', wintypes.DWORD),
+                ]
+            })
+            
+            # Create a dummy window
+            hwnd = user32.CreateWindowExA(
+                0, b"STATIC", b"Dummy OpenGL Window",
+                0, 0, 0, 1, 1, None, None, None, None
+            )
+            
+            if not hwnd:
+                raise RuntimeError("Failed to create dummy window")
+            
+            hdc = user32.GetDC(hwnd)
+            if not hdc:
+                raise RuntimeError("Failed to get device context")
+            
+            # Set up pixel format
+            pfd = PIXELFORMATDESCRIPTOR()
+            pfd.nSize = ctypes.sizeof(PIXELFORMATDESCRIPTOR)
+            pfd.nVersion = 1
+            pfd.dwFlags = 0x25  # PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER
+            pfd.iPixelType = 0  # PFD_TYPE_RGBA
+            pfd.cColorBits = 32
+            pfd.cDepthBits = 24
+            pfd.cStencilBits = 8
+            pfd.iLayerType = 0  # PFD_MAIN_PLANE
+            
+            pixel_format = gdi32.ChoosePixelFormat(hdc, ctypes.byref(pfd))
+            if not pixel_format:
+                raise RuntimeError("Failed to choose pixel format")
+            
+            if not gdi32.SetPixelFormat(hdc, pixel_format, ctypes.byref(pfd)):
+                raise RuntimeError("Failed to set pixel format")
+            
+            # Create OpenGL context
+            hglrc = user32.wglCreateContext(hdc)
+            if not hglrc:
+                raise RuntimeError("Failed to create OpenGL context")
+            
+            if not user32.wglMakeCurrent(hdc, hglrc):
+                raise RuntimeError("Failed to make OpenGL context current")
+            
+            gl_context_created = True
+            init_opengl(WINDOW_WIDTH, WINDOW_HEIGHT)
+            return True
+        return False
+    except Exception as e:
+        print(f"Alternative OpenGL context creation failed: {e}")
+        return False
 
 def init_opengl(width, height):
-    """Initializes OpenGL context settings."""
     glEnable(GL_DEPTH_TEST)
     glEnable(GL_LIGHTING)
     glEnable(GL_LIGHT0)
     glEnable(GL_COLOR_MATERIAL)
     glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+
+    light_ambient = [0.2, 0.2, 0.2, 1.0]
+    light_diffuse = [0.8, 0.8, 0.8, 1.0]
+    light_specular = [0.5, 0.5, 0.5, 1.0]
+    light_position = [2.0, 2.0, 5.0, 1.0]
 
     glLightfv(GL_LIGHT0, GL_AMBIENT, light_ambient)
     glLightfv(GL_LIGHT0, GL_DIFFUSE, light_diffuse)
@@ -70,121 +180,211 @@ def init_opengl(width, height):
     glLightfv(GL_LIGHT0, GL_POSITION, light_position)
 
     glShadeModel(GL_SMOOTH)
-    glClearColor(0.1, 0.1, 0.15, 0.0) # Dark background
+    glClearColor(0.1, 0.1, 0.15, 0.0)
     glClearDepth(1.0)
 
     glViewport(0, 0, width, height)
     glMatrixMode(GL_PROJECTION)
     glLoadIdentity()
-    gluPerspective(45.0, float(width) / float(height), 0.1, 100.0)
+    gluPerspective(45.0, float(width)/float(height), 0.1, 100.0)
     glMatrixMode(GL_MODELVIEW)
 
-def load_model(obj_file_path):
-    """Loads an OBJ model using pywavefront."""
-    global scene, model_scale, model_translation
+def find_model_file(file_path):
+    if os.path.isfile(file_path):
+        return file_path
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    alternative_path = os.path.join(script_dir, os.path.basename(file_path))
+    
+    if os.path.isfile(alternative_path):
+        return alternative_path
+    
+    return None
+
+def create_basic_cube(file_path):
     try:
-        loaded_scene = pywavefront.Wavefront(obj_file_path, collect_faces=True, parse=True)
+        with open(file_path, 'w') as f:
+            f.write("""# Simple cube OBJ file
+v -1.0 -1.0  1.0
+v  1.0 -1.0  1.0
+v  1.0  1.0  1.0
+v -1.0  1.0  1.0
+v -1.0 -1.0 -1.0
+v  1.0 -1.0 -1.0
+v  1.0  1.0 -1.0
+v -1.0  1.0 -1.0
 
-        # Calculate initial scale and center
-        all_vertices = np.array([v for mesh in loaded_scene.mesh_list for v in mesh.vertices])
-        if len(all_vertices) == 0:
-            print(f"Warning: Model '{obj_file_path}' contains no vertices.")
-            return None # Return None if model is empty
+f 1 2 3 4
+f 5 8 7 6
+f 1 4 8 5
+f 2 6 7 3
+f 3 7 8 4
+f 1 5 6 2
+""")
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to create basic cube: {e}")
+        return False
 
+def load_model(model_file_path):
+    global scene, model_scale, model_translation, model_type, model_meshes
+    
+    try:
+        _, file_ext = os.path.splitext(model_file_path.lower())
+        actual_path = find_model_file(model_file_path)
+        
+        if not actual_path:
+            if os.path.basename(model_file_path).lower() == "cube.obj":
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                cube_path = os.path.join(script_dir, "cube.obj")
+                if create_basic_cube(cube_path):
+                    actual_path = cube_path
+                    file_ext = ".obj"
+                else:
+                    raise FileNotFoundError(f"Could not create cube at {cube_path}")
+            else:
+                raise FileNotFoundError(f"Model file not found at {model_file_path}")
+        
+        if file_ext == ".obj":
+            model_type = "OBJ"
+            scene = pywavefront.Wavefront(actual_path, collect_faces=True, parse=True)
+            all_vertices = np.array([v for mesh in scene.mesh_list for v in mesh.vertices])
+            
+        elif file_ext == ".fbx":
+            model_type = "FBX"
+            if pymeshlab:
+                ms = pymeshlab.MeshSet()
+                ms.load_new_mesh(actual_path)
+                model_meshes = []
+                for mesh_idx in range(ms.mesh_number()):
+                    mesh = ms.mesh(mesh_idx)
+                    model_meshes.append({
+                        'vertices': mesh.vertex_matrix(),
+                        'faces': mesh.face_matrix(),
+                        'material': None
+                    })
+                all_vertices = np.vstack([mesh['vertices'] for mesh in model_meshes])
+            else:
+                mesh = trimesh.load(actual_path)
+                if isinstance(mesh, trimesh.Scene):
+                    model_meshes = []
+                    for geometry_name, geometry in mesh.geometry.items():
+                        transform = mesh.graph.get(geometry_name)[0]
+                        vertices = np.array(geometry.vertices)
+                        faces = np.array(geometry.faces)
+                        if transform is not None:
+                            vertices = trimesh.transformations.transform_points(vertices, transform)
+                        model_meshes.append({
+                            'vertices': vertices,
+                            'faces': faces,
+                            'material': None
+                        })
+                    all_vertices = np.vstack([mesh['vertices'] for mesh in model_meshes])
+                else:
+                    model_meshes = [{
+                        'vertices': np.array(mesh.vertices),
+                        'faces': np.array(mesh.faces),
+                        'material': None
+                    }]
+                    all_vertices = np.array(mesh.vertices)
+            scene = None
+        else:
+            raise ValueError(f"Unsupported file format: {file_ext}")
+        
         min_coords = np.min(all_vertices, axis=0)
         max_coords = np.max(all_vertices, axis=0)
         center = (min_coords + max_coords) / 2.0
         size = np.max(max_coords - min_coords)
-
-        # Normalize scale and position
-        scale_factor = DEFAULT_MODEL_SCALE / max(size, 1e-6) # Avoid division by zero
-        model_scale = scale_factor
-        model_translation = [-center[0] * scale_factor, -center[1] * scale_factor, -5.0] # Center and move back
-
-        print(f"Loaded model: {os.path.basename(obj_file_path)}")
-        print(f" - Vertices: {len(all_vertices)}")
-        print(f" - Initial Center: {center}")
-        print(f" - Initial Size: {size}")
-        print(f" - Applied Scale: {model_scale}")
-        print(f" - Initial Translation: {model_translation}")
-
-        return loaded_scene
-    except FileNotFoundError:
-        print(f"ERROR: Model file not found: {obj_file_path}")
-        return None
+        model_scale = DEFAULT_MODEL_SCALE / max(size, 1e-6)
+        model_translation = [-center[0]*model_scale, -center[1]*model_scale, -5.0]
+        
+        print(f"Loaded {model_type} model: {os.path.basename(actual_path)}")
+        return True
+        
     except Exception as e:
-        print(f"ERROR: Failed to load model '{obj_file_path}': {e}")
+        print(f"ERROR: Failed to load model '{model_file_path}': {e}")
         return None
 
-def draw_model(current_scene):
-    """Renders the loaded OBJ model."""
-    if not current_scene:
+def draw_model():
+    global model_type, model_meshes, scene
+    
+    if model_type is None:
         return
-
+        
     glPushMatrix()
-    # Apply transformations
     glTranslatef(model_translation[0], model_translation[1], model_translation[2])
-    glRotatef(model_rotation[0], 1.0, 0.0, 0.0) # Rotate around X
-    glRotatef(model_rotation[1], 0.0, 1.0, 0.0) # Rotate around Y
-    glRotatef(model_rotation[2], 0.0, 0.0, 1.0) # Rotate around Z
+    glRotatef(model_rotation[0], 1.0, 0.0, 0.0)
+    glRotatef(model_rotation[1], 0.0, 1.0, 0.0)
+    glRotatef(model_rotation[2], 0.0, 0.0, 1.0)
     glScalef(model_scale, model_scale, model_scale)
 
-    # Render using pywavefront's drawing capabilities
-    for mesh in current_scene.mesh_list:
-        glBegin(GL_TRIANGLES)
-        for face in mesh.faces:
-            for vertex_index in face:
-                if vertex_index < len(current_scene.vertices):
-                    vertex = current_scene.vertices[vertex_index]
-                    if len(vertex) >= 3: # Ensure vertex has at least 3 components (x, y, z)
-                        # Check for normals (optional but recommended for lighting)
-                        if vertex_index < len(current_scene.normals):
-                             normal = current_scene.normals[vertex_index]
-                             if len(normal) == 3:
-                                 glNormal3fv(normal)
-                        # Set vertex color (if available, otherwise use default)
-                        # pywavefront doesn't directly expose vertex colors easily here
-                        # We'll rely on glColorMaterial and potentially material colors if set
-                        glVertex3fv(vertex[:3]) # Use only x, y, z
-        glEnd()
+    if model_type == "OBJ" and scene:
+        for mesh in scene.mesh_list:
+            glBegin(GL_TRIANGLES)
+            for face in mesh.faces:
+                for vertex_index in face:
+                    if vertex_index < len(scene.vertices):
+                        vertex = scene.vertices[vertex_index]
+                        if len(vertex) >= 3:
+                            glNormal3f(0.0, 0.0, 1.0)
+                            glVertex3fv(vertex[:3])
+            glEnd()
+    
+    elif model_type == "FBX" and model_meshes:
+        for mesh in model_meshes:
+            vertices = mesh['vertices']
+            faces = mesh['faces']
+            
+            glBegin(GL_TRIANGLES)
+            for face in faces:
+                if len(face) >= 3:
+                    v0 = vertices[face[0]]
+                    v1 = vertices[face[1]]
+                    v2 = vertices[face[2]]
+                    
+                    normal = np.cross(v1-v0, v2-v0)
+                    normal = normal/np.linalg.norm(normal) if np.linalg.norm(normal) > 0 else [0,0,1]
+                    
+                    glNormal3fv(normal)
+                    for vertex_idx in face:
+                        if vertex_idx < len(vertices):
+                            glVertex3fv(vertices[vertex_idx])
+            glEnd()
 
     glPopMatrix()
 
-def render_gl_scene(width, height, current_scene):
-    """Renders the OpenGL scene and returns it as a NumPy array."""
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-    glLoadIdentity()
+def render_gl_scene(width, height):
+    if not gl_context_created:
+        return np.zeros((height, width, 3), dtype=np.uint8)
+    
+    try:
+        glViewport(0, 0, width, height)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(45.0, float(width)/float(height), 0.1, 100.0)
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+        
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        draw_model()
 
-    # Position the light relative to the view
-    glLightfv(GL_LIGHT0, GL_POSITION, light_position)
+        glReadBuffer(GL_BACK)
+        pixels = glReadPixels(0, 0, width, height, GL_BGR, GL_UNSIGNED_BYTE)
+        image = np.frombuffer(pixels, dtype=np.uint8).reshape(height, width, 3)
+        image = cv2.flip(image, 0)
+        
+        glutSwapBuffers()
+        return image
+        
+    except Exception as e:
+        print(f"Error in render_gl_scene: {e}")
+        return np.zeros((height, width, 3), dtype=np.uint8)
 
-    # Draw the model with current transformations
-    draw_model(current_scene)
-
-    # Read pixels back from OpenGL buffer
-    glReadBuffer(GL_FRONT)
-    pixels = glReadPixels(0, 0, width, height, GL_BGR, GL_UNSIGNED_BYTE) # Read as BGR for OpenCV
-
-    # Reshape into NumPy array
-    image = np.frombuffer(pixels, dtype=np.uint8).reshape(height, width, 3)
-    # OpenGL renders bottom-up, OpenCV expects top-down
-    image = cv2.flip(image, 0)
-    return image
-
-# --- MediaPipe Hand Tracking ---
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
-hands = mp_hands.Hands(
-    model_complexity=0, # 0 for faster performance
-    min_detection_confidence=0.6,
-    min_tracking_confidence=0.6,
-    max_num_hands=2)
-
-# --- Gesture Recognition Helpers ---
 def get_landmarks_list(hand_landmarks, frame_shape):
-    """Converts MediaPipe landmarks to a list of (x, y, z) pixel coordinates."""
     h, w = frame_shape[:2]
     landmarks = []
     if hand_landmarks:
@@ -193,108 +393,134 @@ def get_landmarks_list(hand_landmarks, frame_shape):
     return landmarks
 
 def get_hand_center(landmarks_list):
-    """Calculates the approximate center (centroid) of the hand landmarks."""
     if not landmarks_list:
         return None
     x_coords = [lm[0] for lm in landmarks_list]
     y_coords = [lm[1] for lm in landmarks_list]
     center_x = int(np.mean(x_coords))
     center_y = int(np.mean(y_coords))
-    # Use average Z of wrist and MCP joints for a more stable depth estimate
     z_coords = [landmarks_list[i][2] for i in [0, 5, 9, 13, 17] if i < len(landmarks_list)]
     center_z = np.mean(z_coords) if z_coords else 0.0
     return (center_x, center_y, center_z)
 
 def is_fist(landmarks_list):
-    """Determines if a hand is likely in a fist gesture."""
     if not landmarks_list or len(landmarks_list) < 21:
         return False
 
-    # Check if fingertips (8, 12, 16, 20) are close to the palm center/base
-    # Using wrist (0) and middle finger MCP (9) as reference points
     try:
-        wrist = np.array(landmarks_list[0][:2]) # Use only x, y for distance check
+        wrist = np.array(landmarks_list[0][:2])
         mcp_9 = np.array(landmarks_list[9][:2])
         palm_center = (wrist + mcp_9) / 2
 
-        tip_indices = [8, 12, 16, 20]
-        pip_indices = [6, 10, 14, 18] # Proximal Interphalangeal joints
-
-        # Calculate average distance from fingertips to palm center
-        avg_tip_dist = np.mean([np.linalg.norm(np.array(landmarks_list[i][:2]) - palm_center) for i in tip_indices])
-
-        # Calculate average distance from PIP joints to palm center (for reference)
-        avg_pip_dist = np.mean([np.linalg.norm(np.array(landmarks_list[i][:2]) - palm_center) for i in pip_indices])
-
-        # Heuristic: If tips are closer to the palm center than PIP joints (or close to it), it's likely a fist
-        # Add a check for thumb tip (4) being close to index MCP (5) or middle MCP (9)
-        thumb_tip = np.array(landmarks_list[4][:2])
-        index_mcp = np.array(landmarks_list[5][:2])
-        thumb_dist_to_index = np.linalg.norm(thumb_tip - index_mcp)
-
-        # Thresholds (may need tuning)
-        fist_tip_threshold_ratio = 0.9 # Tips should be closer than PIPs
-        fist_thumb_threshold = np.linalg.norm(np.array(landmarks_list[5][:2]) - np.array(landmarks_list[17][:2])) * 0.6 # Thumb close to index base
-
-        # print(f"Debug Fist: Avg Tip Dist: {avg_tip_dist:.2f}, Avg PIP Dist: {avg_pip_dist:.2f}, Thumb Dist: {thumb_dist_to_index:.2f}")
-
-        return avg_tip_dist < avg_pip_dist * fist_tip_threshold_ratio and thumb_dist_to_index < fist_thumb_threshold
-
-    except IndexError:
-        # Handle cases where landmarks might be missing temporarily
+        fingertip_distances = [np.linalg.norm(np.array(landmarks_list[tip][:2]) - palm_center) for tip in [8,12,16,20]]
+        knuckle_distances = [np.linalg.norm(np.array(landmarks_list[knuckle][:2]) - palm_center) for knuckle in [5,9,13,17]]
+        
+        fist_ratio = sum(fingertip_distances) / (sum(knuckle_distances) + 1e-6)
+        thumb_distance = np.linalg.norm(np.array(landmarks_list[4][:2]) - np.array(landmarks_list[5][:2]))
+        hand_width = np.linalg.norm(np.array(landmarks_list[5][:2]) - np.array(landmarks_list[17][:2]))
+        
+        return fist_ratio < 0.85 and thumb_distance < 0.45 * hand_width
+    except Exception:
         return False
-    except Exception as e:
-        print(f"Error in is_fist: {e}")
-        return False
-
 
 def calculate_distance(p1, p2):
-    """Calculates Euclidean distance between two 3D points."""
-    return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2 + (p1[2] - p2[2])**2)
+    return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 + (p1[2]-p2[2])**2)
 
 def calculate_2d_distance(p1, p2):
-    """Calculates Euclidean distance between two 2D points."""
-    return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+    return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
 
+def is_pinch_gesture(landmarks_list):
+    if not landmarks_list or len(landmarks_list) < 21:
+        return False
+    
+    try:
+        thumb_tip = landmarks_list[4]
+        index_tip = landmarks_list[8]
+        distance = calculate_2d_distance(thumb_tip, index_tip)
+        
+        wrist = landmarks_list[0]
+        middle_mcp = landmarks_list[9]
+        hand_size = calculate_2d_distance(wrist, middle_mcp)
+        
+        return distance < 0.15 * hand_size
+    except Exception:
+        return False
 
-# --- Main Application Logic ---
+def process_hands(frame, results, flip_coordinates=True):
+    detected_hands = []
+    
+    if results.multi_hand_landmarks:
+        annotated_frame = frame.copy()
+        
+        for i, hand_landmarks in enumerate(results.multi_hand_landmarks):
+            mp_drawing.draw_landmarks(
+                annotated_frame,
+                hand_landmarks,
+                mp_hands.HAND_CONNECTIONS,
+                mp_drawing_styles.get_default_hand_landmarks_style(),
+                mp_drawing_styles.get_default_hand_connections_style())
+
+            landmarks_list = get_landmarks_list(hand_landmarks, frame.shape)
+            if landmarks_list:
+                handedness = results.multi_handedness[i].classification[0].label
+                if flip_coordinates:
+                    handedness = "Right" if handedness == "Left" else "Left"
+                
+                detected_hands.append({
+                    "landmarks": landmarks_list,
+                    "center": get_hand_center(landmarks_list),
+                    "handedness": handedness,
+                    "is_fist": is_fist(landmarks_list),
+                    "is_pinch": is_pinch_gesture(landmarks_list)
+                })
+        
+        return annotated_frame, detected_hands
+    
+    return frame, detected_hands
+
 def main(model_path):
     global scene, interaction_mode, model_translation, model_rotation, model_scale
-    global last_hand_centers, initial_pinch_distance, last_gesture_time
+    global last_hand_centers, initial_pinch_distance, last_gesture_time, gesture_lock
+    global gl_context_created
 
-    # --- Initialization ---
     print("Initializing AetherManipulator...")
-
-    # Load Model
-    scene = load_model(model_path)
-    if scene is None:
-        # Attempt to load a default/fallback model if primary fails?
-        # For now, just exit if the specified model fails.
-        print("Exiting due to model loading failure.")
+    
+    if not initialize_glut():
+        print("Warning: OpenGL context creation failed - 3D rendering may not work")
+        print("Please ensure you have freeglut installed on your system")
+        print("On Windows, download freeglut.dll and place it in:")
+        print("1. The same directory as this script")
+        print("2. Your system32 folder (C:\\Windows\\System32)")
+        print("3. Any directory in your system PATH")
+    
+    if not load_model(model_path):
+        print("\nModel loading failed. Exiting.")
         return
 
-    # Initialize Video Capture
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("ERROR: Cannot open webcam.")
         return
+    
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, WINDOW_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, WINDOW_HEIGHT)
     actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Webcam opened: {actual_width}x{actual_height}")
-
-    # Create OpenCV window and initialize OpenGL
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL) # Use NORMAL for potential resizing
+    
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, actual_width, actual_height)
-    # Crucially, init OpenGL *after* the window context might be available (though not directly bound)
-    # We render offscreen anyway, so direct binding isn't strictly necessary here.
-    init_opengl(actual_width, actual_height)
+    
+    hands = mp_hands.Hands(
+        model_complexity=0,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.7,
+        max_num_hands=2)
+    
+    print("Starting real-time loop...")
 
-    print("Initialization complete. Starting real-time loop...")
-
-    # --- Main Loop ---
     prev_time = time.time()
+    smoothing_factor = 0.2
+    
     while cap.isOpened():
         success, frame = cap.read()
         if not success:
@@ -306,206 +532,134 @@ def main(model_path):
         prev_time = current_time
         fps = 1.0 / delta_time if delta_time > 0 else 0
 
-        # Flip the frame horizontally for a later selfie-view display
-        # Process the original frame for MediaPipe
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mirrored_frame = cv2.flip(frame, 1)
+        frame_rgb = cv2.cvtColor(mirrored_frame, cv2.COLOR_BGR2RGB)
         results = hands.process(frame_rgb)
+        processed_frame, detected_hands = process_hands(mirrored_frame, results, flip_coordinates=False)
 
-        # Prepare flipped frame for drawing
-        frame = cv2.flip(frame, 1)
-
-        # Process hand landmarks
-        detected_hands = []
-        if results.multi_hand_landmarks:
-            for i, hand_landmarks in enumerate(results.multi_hand_landmarks):
-                # Draw landmarks on the *flipped* frame
-                mp_drawing.draw_landmarks(
-                    frame,
-                    hand_landmarks,
-                    mp_hands.HAND_CONNECTIONS,
-                    mp_drawing_styles.get_default_hand_landmarks_style(),
-                    mp_drawing_styles.get_default_hand_connections_style())
-
-                landmarks_list = get_landmarks_list(hand_landmarks, frame.shape)
-                if landmarks_list:
-                    hand_center = get_hand_center(landmarks_list)
-                    # Store hand data (landmarks, center, handedness)
-                    handedness = results.multi_handedness[i].classification[0].label
-                    detected_hands.append({
-                        "landmarks": landmarks_list,
-                        "center": hand_center,
-                        "handedness": handedness,
-                        "is_fist": is_fist(landmarks_list)
-                    })
-
-        # --- Gesture Mapping and State Update ---
         num_hands = len(detected_hands)
         current_hand_centers = [None, None]
-        gesture_debounce_time = 0.2 # Seconds to wait before changing mode
-
-        # Determine Interaction Mode based on number of hands and gestures
-        new_mode = interaction_mode # Default to current mode
-        if num_hands == 1:
-            hand = detected_hands[0]
-            current_hand_centers[0] = hand["center"]
-            if hand["is_fist"]:
-                new_mode = "ROTATE"
-            else: # Open hand
-                new_mode = "TRANSLATE"
-        elif num_hands == 2:
-            new_mode = "SCALE"
-            # Ensure consistent ordering (e.g., left hand first if possible)
-            hand0 = detected_hands[0] if detected_hands[0]['handedness'] == 'Left' else detected_hands[1]
-            hand1 = detected_hands[1] if detected_hands[0]['handedness'] == 'Left' else detected_hands[0]
-            current_hand_centers[0] = hand0["center"]
-            current_hand_centers[1] = hand1["center"]
-        else: # No hands or more than 2 (ignore > 2 for now)
-            new_mode = interaction_mode # Keep last mode briefly
-            last_hand_centers = [None, None] # Reset tracking history
-            initial_pinch_distance = None
-
-        # Apply mode change with debounce
-        if new_mode != interaction_mode and (current_time - last_gesture_time > gesture_debounce_time):
-             interaction_mode = new_mode
-             print(f"Mode changed to: {interaction_mode}")
-             last_gesture_time = current_time
-             # Reset state specific to the *previous* mode if needed
-             if interaction_mode != "SCALE":
-                 initial_pinch_distance = None # Reset pinch distance if not scaling
-             if interaction_mode != "TRANSLATE" and interaction_mode != "ROTATE":
-                 last_hand_centers = [None, None] # Reset single hand tracking
-
-
-        # --- Apply Transformations based on Mode ---
-        if interaction_mode == "TRANSLATE" and num_hands == 1:
-            if last_hand_centers[0] and current_hand_centers[0]:
-                delta_x = current_hand_centers[0][0] - last_hand_centers[0][0]
-                delta_y = current_hand_centers[0][1] - last_hand_centers[0][1]
-                # Use Z from landmarks for depth translation (experimental)
-                # delta_z = (current_hand_centers[0][2] - last_hand_centers[0][2]) * 5.0 # Adjust sensitivity
-
-                # Map screen coordinates (pixels) to model coordinates
-                # Adjust sensitivity based on window size
-                trans_sensitivity_x = MODEL_TRANSLATION_SPEED / actual_width
-                trans_sensitivity_y = MODEL_TRANSLATION_SPEED / actual_height
-
-                model_translation[0] += delta_x * trans_sensitivity_x
-                model_translation[1] -= delta_y * trans_sensitivity_y # Invert Y
-                # model_translation[2] += delta_z # Add Z translation
-
-            last_hand_centers[0] = current_hand_centers[0]
-            last_hand_centers[1] = None # Ensure second hand history is clear
-
-        elif interaction_mode == "ROTATE" and num_hands == 1:
-            if last_hand_centers[0] and current_hand_centers[0]:
-                delta_x = current_hand_centers[0][0] - last_hand_centers[0][0]
-                delta_y = current_hand_centers[0][1] - last_hand_centers[0][1]
-
-                # Map horizontal movement to Y-axis rotation, vertical to X-axis rotation
-                model_rotation[1] += delta_x * MODEL_ROTATION_SPEED # Yaw
-                model_rotation[0] += delta_y * MODEL_ROTATION_SPEED # Pitch
-                # Keep angles reasonable (optional)
-                # model_rotation[0] = max(-90, min(90, model_rotation[0]))
-
-            last_hand_centers[0] = current_hand_centers[0]
-            last_hand_centers[1] = None
-
-        elif interaction_mode == "SCALE" and num_hands == 2:
-            # Use distance between index finger tips (landmark 8)
-            try:
-                index_tip1 = detected_hands[0]["landmarks"][8]
-                index_tip2 = detected_hands[1]["landmarks"][8]
-                current_pinch_distance = calculate_2d_distance(index_tip1, index_tip2)
-
-                if initial_pinch_distance is None:
-                    initial_pinch_distance = current_pinch_distance # Capture starting distance
-                elif initial_pinch_distance > 1e-6: # Avoid division by zero
-                    scale_factor_change = current_pinch_distance / initial_pinch_distance
-                    # Apply smooth scaling with a limit to prevent sudden jumps
-                    scale_change_clamped = max(0.8, min(1.2, scale_factor_change))  # Limit to 20% change per frame
-                    model_scale *= scale_change_clamped
-                    
-                    # Keep scale within reasonable bounds
-                    model_scale = max(0.1, min(10.0, model_scale))
-                    
-                    # Update initial distance for next frame (smooths movement)
-                    initial_pinch_distance = current_pinch_distance
-            except (IndexError, KeyError) as e:
-                print(f"Error in SCALE mode: {e}")
+        
+        if num_hands >= 1:
+            detected_hands.sort(key=lambda x: x["handedness"])
+            
+            if num_hands == 1 and detected_hands[0]["is_pinch"] and not gesture_lock and (current_time - last_gesture_time) > 0.5:
+                modes = ["TRANSLATE", "ROTATE", "SCALE"]
+                current_index = modes.index(interaction_mode) if interaction_mode in modes else 0
+                interaction_mode = modes[(current_index + 1) % len(modes)]
+                print(f"Mode changed to: {interaction_mode}")
+                last_gesture_time = current_time
+                gesture_lock = True
+            
+            if num_hands == 1 and not detected_hands[0]["is_pinch"]:
+                gesture_lock = False
+            
+            for i, hand in enumerate(detected_hands[:2]):
+                current_hand_centers[i] = hand["center"]
                 
-            last_hand_centers[0] = current_hand_centers[0]
-            last_hand_centers[1] = current_hand_centers[1]
-
-        # --- Render OpenGL Scene ---
-        # Create the 3D visualization using OpenGL
-        gl_frame = render_gl_scene(actual_width, actual_height, scene)
+                if interaction_mode == "TRANSLATE" and last_hand_centers[i] and current_hand_centers[i]:
+                    delta_x = current_hand_centers[i][0] - last_hand_centers[i][0]
+                    delta_y = current_hand_centers[i][1] - last_hand_centers[i][1]
+                    
+                    target_x = model_translation[0] + delta_x * MODEL_TRANSLATION_SPEED / actual_width
+                    target_y = model_translation[1] - delta_y * MODEL_TRANSLATION_SPEED / actual_height
+                    
+                    model_translation[0] += (target_x - model_translation[0]) * smoothing_factor
+                    model_translation[1] += (target_y - model_translation[1]) * smoothing_factor
+                
+                elif interaction_mode == "ROTATE" and last_hand_centers[i] and current_hand_centers[i] and not hand["is_pinch"]:
+                    delta_x = current_hand_centers[i][0] - last_hand_centers[i][0]
+                    delta_y = current_hand_centers[i][1] - last_hand_centers[i][1]
+                    
+                    target_yaw = model_rotation[1] + delta_x * MODEL_ROTATION_SPEED
+                    target_pitch = model_rotation[0] + delta_y * MODEL_ROTATION_SPEED
+                    
+                    model_rotation[1] += (target_yaw - model_rotation[1]) * smoothing_factor
+                    model_rotation[0] += (target_pitch - model_rotation[0]) * smoothing_factor
+                
+                elif interaction_mode == "SCALE" and last_hand_centers[i] and current_hand_centers[i]:
+                    delta_y = current_hand_centers[i][1] - last_hand_centers[i][1]
+                    target_scale = model_scale - delta_y * MODEL_SCALE_SPEED / actual_height
+                    target_scale = max(0.1, min(5.0, target_scale))
+                    model_scale += (target_scale - model_scale) * smoothing_factor
         
-        # Combine camera feed and OpenGL rendering
-        # Use alpha blending for a semi-transparent overlay effect
-        alpha = 0.7  # OpenGL visualization opacity
-        beta = 1.0 - alpha  # Camera feed opacity
+        if num_hands == 2 and all(hand["is_pinch"] for hand in detected_hands[:2]) and all(current_hand_centers):
+            if all(last_hand_centers) and initial_pinch_distance is None:
+                initial_pinch_distance = calculate_distance(current_hand_centers[0], current_hand_centers[1])
+            
+            if initial_pinch_distance:
+                current_distance = calculate_distance(current_hand_centers[0], current_hand_centers[1])
+                if current_distance > 0 and initial_pinch_distance > 0:
+                    scale_factor = current_distance / initial_pinch_distance
+                    target_scale = model_scale * scale_factor
+                    target_scale = max(0.1, min(5.0, target_scale))
+                    model_scale = target_scale
+                    initial_pinch_distance = current_distance
+        else:
+            initial_pinch_distance = None
         
-        # Resize frames if dimensions don't match
-        if gl_frame.shape != frame.shape:
-            gl_frame = cv2.resize(gl_frame, (frame.shape[1], frame.shape[0]))
+        last_hand_centers = current_hand_centers
         
-        # Overlay the GL visualization on the camera feed
-        combined_frame = cv2.addWeighted(frame, beta, gl_frame, alpha, 0)
-
-        # --- Draw UI Elements ---
-        # Draw mode indicator
-        mode_text = f"Mode: {interaction_mode}"
-        cv2.putText(combined_frame, mode_text, (20, 30), UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
+        model_frame = render_gl_scene(actual_width, actual_height)
+        combined_frame = cv2.addWeighted(processed_frame, 0.7, model_frame, 0.3, 0)
         
-        # Draw FPS counter
-        fps_text = f"FPS: {fps:.1f}"
-        cv2.putText(combined_frame, fps_text, (20, 60), UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
+        cv2.putText(combined_frame, f"FPS: {int(fps)}", (20, 30), UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
+        cv2.putText(combined_frame, f"Mode: {interaction_mode}", (20, 70), UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
         
-        # Draw transformation values
-        trans_text = f"Position: X={model_translation[0]:.1f} Y={model_translation[1]:.1f} Z={model_translation[2]:.1f}"
-        cv2.putText(combined_frame, trans_text, (20, actual_height - 90), UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
+        gesture_text = ""
+        if num_hands == 0:
+            gesture_text = "No hands detected"
+        elif num_hands == 1:
+            if detected_hands[0]["is_pinch"]:
+                gesture_text = "Pinch detected (Change mode)"
+            elif detected_hands[0]["is_fist"]:
+                gesture_text = "Fist detected"
+            else:
+                gesture_text = f"Manipulating in {interaction_mode} mode"
+        elif num_hands == 2:
+            if all(hand["is_pinch"] for hand in detected_hands[:2]):
+                gesture_text = "Two pinches detected (Scaling)"
+            else:
+                gesture_text = "Two hands detected"
         
-        rot_text = f"Rotation: X={model_rotation[0]:.1f} Y={model_rotation[1]:.1f} Z={model_rotation[2]:.1f}"
-        cv2.putText(combined_frame, rot_text, (20, actual_height - 60), UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
+        cv2.putText(combined_frame, gesture_text, (20, 110), UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
+        cv2.putText(combined_frame, "Q: Quit | R: Reset Rotation | T: Reset Position | S: Reset Scale", (20, 150), UI_FONT, 0.5, UI_COLOR, 1)
         
-        scale_text = f"Scale: {model_scale:.2f}"
-        cv2.putText(combined_frame, scale_text, (20, actual_height - 30), UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
-        
-        # Show controls help
-        controls_text = "Controls: Open hand=Move | Fist=Rotate | Two hands=Scale | ESC=Exit"
-        cv2.putText(combined_frame, controls_text, 
-                    (int(actual_width/2) - 300, actual_height - 30), 
-                    UI_FONT, UI_SCALE, UI_COLOR, UI_THICKNESS)
-
-        # Show the combined frame
         cv2.imshow(WINDOW_NAME, combined_frame)
         
-        # Check for keyboard input
         key = cv2.waitKey(1) & 0xFF
-        if key == 27:  # ESC key
-            print("ESC pressed. Exiting...")
+        if key == ord('q') or key == 27:
             break
-        elif key == ord('r'):  # Reset transformations
-            model_translation = [0.0, 0.0, -5.0]
+        elif key == ord('r'):
             model_rotation = [0.0, 0.0, 0.0]
+        elif key == ord('t'):
+            model_translation = [0.0, 0.0, -5.0]
+        elif key == ord('s'):
             model_scale = DEFAULT_MODEL_SCALE
-            print("Transformations reset.")
-
-    # --- Cleanup ---
+        elif key == ord('m'):
+            modes = ["TRANSLATE", "ROTATE", "SCALE"]
+            current_index = modes.index(interaction_mode) if interaction_mode in modes else 0
+            interaction_mode = modes[(current_index + 1) % len(modes)]
+            print(f"Mode changed to: {interaction_mode}")
+    
     hands.close()
     cap.release()
     cv2.destroyAllWindows()
-    print("AetherManipulator terminated.")
+    
+    if gl_context_created:
+        try:
+            glutDestroyWindow(gl_window_id)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AetherManipulator - Manipulate 3D models with hand gestures")
-    parser.add_argument("model_path", type=str, help="Path to OBJ model file")
-    parser.add_argument("--scale", type=float, default=DEFAULT_MODEL_SCALE, help=f"Initial model scale (default: {DEFAULT_MODEL_SCALE})")
-    
+    parser = argparse.ArgumentParser(description="AetherManipulator: 3D model manipulation using hand gestures")
+    parser.add_argument('--model', default='cube.obj', help='Path to 3D model file (.obj or .fbx)')
     args = parser.parse_args()
     
-    # Set initial scale if provided
-    DEFAULT_MODEL_SCALE = args.scale
-    model_scale = DEFAULT_MODEL_SCALE
-    
-    main(args.model_path)
+    try:
+        main(args.model)
+    except Exception as e:
+        print(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
