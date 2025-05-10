@@ -1,233 +1,302 @@
 import cv2
 import numpy as np
-import math
+import pygame
+from pygame.locals import *
+from OpenGL.GL import *
+from OpenGL.GLU import *
+import sys
 import time
+import math
+import mediapipe as mp
 
-class SimpleAR:
+class ARHandTracker:
     def __init__(self):
         # Initialize webcam
         self.cap = cv2.VideoCapture(0)
         if not self.cap.isOpened():
             print("Could not open webcam")
-            return
-        
+            sys.exit()
+            
         # Get webcam dimensions
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        # Create a cube vertices (8 corners)
-        self.cube_vertices = np.array([
-            [-1, -1, -1],  # 0: back-bottom-left
-            [1, -1, -1],   # 1: back-bottom-right
-            [1, 1, -1],    # 2: back-top-right
-            [-1, 1, -1],   # 3: back-top-left
-            [-1, -1, 1],   # 4: front-bottom-left
-            [1, -1, 1],    # 5: front-bottom-right
-            [1, 1, 1],     # 6: front-top-right
-            [-1, 1, 1]     # 7: front-top-left
-        ], dtype=float)
+        # Initialize pygame
+        pygame.init()
+        self.display = (800, 600)
+        pygame.display.set_caption("AR Hand Tracking - Press ESC to quit")
+        self.screen = pygame.display.set_mode(self.display, DOUBLEBUF | OPENGL)
         
-        # Define cube edges as pairs of vertex indices
-        self.cube_edges = [
-            (0, 1), (1, 2), (2, 3), (3, 0),  # back face
-            (4, 5), (5, 6), (6, 7), (7, 4),  # front face
-            (0, 4), (1, 5), (2, 6), (3, 7)   # connecting edges
-        ]
+        # Create a separate surface for the webcam feed
+        self.background_surface = pygame.Surface((self.display[0], self.display[1]))
         
-        # Create a pyramid vertices (5 points)
-        self.pyramid_vertices = np.array([
-            [0, 0, 1],      # 0: apex
-            [-1, -1, -1],   # 1: base front-left
-            [1, -1, -1],    # 2: base front-right
-            [1, 1, -1],     # 3: base back-right
-            [-1, 1, -1]     # 4: base back-left
-        ], dtype=float)
+        # Set up perspective
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(45, (self.display[0] / self.display[1]), 0.1, 50.0)
         
-        # Define pyramid edges
-        self.pyramid_edges = [
-            (0, 1), (0, 2), (0, 3), (0, 4),  # edges from apex to base
-            (1, 2), (2, 3), (3, 4), (4, 1)   # base edges
-        ]
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+        glTranslatef(0.0, 0.0, -5)
         
-        # Create sphere approximation (we'll use a geodesic sphere)
-        self.sphere_vertices, self.sphere_edges = self.create_geodesic_sphere(2)
+        # Enable depth test and lighting
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_LIGHTING)
+        glEnable(GL_LIGHT0)
+        glEnable(GL_COLOR_MATERIAL)
+        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
         
-        # Scale and initial position for our objects
-        self.cube_scale = 40
-        self.pyramid_scale = 30
-        self.sphere_scale = 35
+        # Light position and properties
+        glLightfv(GL_LIGHT0, GL_POSITION, [5, 5, 5, 1])
+        glLightfv(GL_LIGHT0, GL_AMBIENT, [0.2, 0.2, 0.2, 1])
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, [0.8, 0.8, 0.8, 1])
         
-        # Starting rotation angles
-        self.angle_x = 0
-        self.angle_y = 0
-        self.angle_z = 0
+        # Initialize MediaPipe hands
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.mp_drawing = mp.solutions.drawing_utils
+        
+        # Initialize 3D objects
+        self.init_objects()
         
         # Start time for animation
         self.start_time = time.time()
         
-        # Colors in BGR format
-        self.cube_color = (255, 0, 0)      # Blue
-        self.pyramid_color = (0, 255, 0)   # Green
-        self.sphere_color = (0, 0, 255)    # Red
+        # Hand position tracking
+        self.hand_positions = []
+        self.hand_gestures = []
+        self.is_grabbing = False
+        
+        # For hybrid rendering (2D + 3D)
+        self.clock = pygame.time.Clock()
+        
+    def init_objects(self):
+        # Define cube vertices
+        self.vertices = (
+            (1, -1, -1),
+            (1, 1, -1),
+            (-1, 1, -1),
+            (-1, -1, -1),
+            (1, -1, 1),
+            (1, 1, 1),
+            (-1, 1, 1),
+            (-1, -1, 1)
+        )
+        
+        # Define cube surfaces (quads)
+        self.surfaces = (
+            (0, 1, 2, 3),  # back
+            (3, 2, 6, 7),  # left
+            (7, 6, 5, 4),  # front
+            (4, 5, 1, 0),  # right
+            (1, 5, 6, 2),  # top
+            (4, 0, 3, 7)   # bottom
+        )
+        
+        # Define colors for each surface with alpha (transparency)
+        self.colors = (
+            (0, 0, 1, 0.7),    # Blue
+            (0, 1, 0, 0.7),    # Green
+            (1, 0, 0, 0.7),    # Red
+            (1, 1, 0, 0.7),    # Yellow
+            (1, 0, 1, 0.7),    # Magenta
+            (0, 1, 1, 0.7)     # Cyan
+        )
+        
+        # Object position and rotation
+        self.obj_position = [0, 0, 0]
+        self.obj_rotation = [0, 0, 0]
+        self.obj_scale = 0.5
     
-    def create_geodesic_sphere(self, subdivisions=1):
-        """Create a geodesic sphere by subdividing an icosahedron"""
-        # Start with 12 vertices of an icosahedron
-        t = (1.0 + math.sqrt(5.0)) / 2.0
-        vertices = np.array([
-            [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
-            [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
-            [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]
-        ], dtype=float)
+    def draw_cube(self, position, rotation, scale=1.0):
+        """Draw a colored cube at the specified position"""
+        glPushMatrix()
         
-        # Normalize to make all vertices lie on a unit sphere
-        for i in range(len(vertices)):
-            norm = np.linalg.norm(vertices[i])
-            vertices[i] = vertices[i] / norm
+        # Position and scale
+        glTranslatef(position[0], position[1], position[2])
         
-        # Define the 30 edges of an icosahedron
-        edges = [
-            (0, 5), (0, 11), (0, 1), (0, 7), (0, 10),
-            (1, 5), (1, 9), (1, 8), (1, 7),
-            (2, 3), (2, 4), (2, 6), (2, 10), (2, 11),
-            (3, 4), (3, 6), (3, 8), (3, 9),
-            (4, 5), (4, 9), (4, 11),
-            (5, 9), (5, 11),
-            (6, 7), (6, 8), (6, 10),
-            (7, 8), (7, 10),
-            (8, 9),
-            (10, 11)
-        ]
+        # Apply rotation
+        glRotatef(rotation[0], 1, 0, 0)  # X-axis
+        glRotatef(rotation[1], 0, 1, 0)  # Y-axis
+        glRotatef(rotation[2], 0, 0, 1)  # Z-axis
         
-        return vertices, edges
+        # Apply scaling
+        glScalef(scale, scale, scale)
+        
+        # Enable blending for transparency
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        
+        # Draw each face of the cube
+        glBegin(GL_QUADS)
+        for i, surface in enumerate(self.surfaces):
+            glColor4fv(self.colors[i])
+            for vertex in surface:
+                glVertex3fv(self.vertices[vertex])
+        glEnd()
+        
+        # Disable blending
+        glDisable(GL_BLEND)
+        
+        glPopMatrix()
     
-    def project_point(self, point, angle_x, angle_y, angle_z, scale, offset_x, offset_y):
-        """Project a 3D point onto the 2D screen with rotation"""
-        # Apply rotation around x-axis
-        x, y, z = point
-        y_rot = y * math.cos(angle_x) - z * math.sin(angle_x)
-        z_rot = y * math.sin(angle_x) + z * math.cos(angle_x)
-        x, y, z = x, y_rot, z_rot
+    def process_hands(self, frame):
+        """Process hand landmarks using MediaPipe"""
+        # Convert BGR to RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Apply rotation around y-axis
-        x_rot = x * math.cos(angle_y) + z * math.sin(angle_y)
-        z_rot = -x * math.sin(angle_y) + z * math.cos(angle_y)
-        x, y, z = x_rot, y, z_rot
+        # Process the image to find hands
+        results = self.hands.process(frame_rgb)
         
-        # Apply rotation around z-axis
-        x_rot = x * math.cos(angle_z) - y * math.sin(angle_z)
-        y_rot = x * math.sin(angle_z) + y * math.cos(angle_z)
-        x, y, z = x_rot, y_rot, z
+        # Reset hand positions
+        self.hand_positions = []
+        self.hand_gestures = []
         
-        # Add a z-offset to move objects in front of the camera
-        z += 3
+        # Check if hands were found
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                # Get the 3D coordinates of the hand landmarks
+                landmarks_3d = []
+                for landmark in hand_landmarks.landmark:
+                    x = landmark.x * self.width
+                    y = landmark.y * self.height
+                    z = landmark.z * self.width  # Scale z to match x scale
+                    landmarks_3d.append((x, y, z))
+                
+                # Store hand position (using index finger tip)
+                index_finger_pos = landmarks_3d[8]  # Index finger tip
+                thumb_pos = landmarks_3d[4]  # Thumb tip
+                
+                # Convert to normalized coordinates (-1 to 1)
+                norm_x = (index_finger_pos[0] / self.width) * 2 - 1
+                norm_y = -((index_finger_pos[1] / self.height) * 2 - 1)  # Flip y-axis
+                norm_z = index_finger_pos[2] / self.width
+                
+                # Store hand position
+                self.hand_positions.append((norm_x * 3, norm_y * 3, norm_z))
+                
+                # Detect grabbing gesture (thumb and index finger close together)
+                distance = np.sqrt(
+                    (thumb_pos[0] - index_finger_pos[0])**2 + 
+                    (thumb_pos[1] - index_finger_pos[1])**2 + 
+                    (thumb_pos[2] - index_finger_pos[2])**2
+                )
+                
+                # If distance is less than a threshold, consider it a grabbing gesture
+                is_grabbing = distance < 50  # Adjust threshold as needed
+                self.hand_gestures.append(is_grabbing)
+                
+                # Draw hand landmarks for debugging
+                self.mp_drawing.draw_landmarks(
+                    frame,
+                    hand_landmarks,
+                    self.mp_hands.HAND_CONNECTIONS
+                )
         
-        # Perspective projection
-        f = 200  # focal length
-        if z > 0:
-            x_proj = int(f * x / z * scale + offset_x)
-            y_proj = int(f * y / z * scale + offset_y)
-            return (x_proj, y_proj), 1/z  # Return depth for z-sorting
-        else:
-            return None, 0
+        return frame_rgb
     
-    def draw_3d_object(self, frame, vertices, edges, angle_x, angle_y, angle_z, scale, offset_x, offset_y, color, thickness=2):
-        """Draw a 3D object on the frame"""
-        # Project all vertices
-        projected_points = []
-        for v in vertices:
-            proj, depth = self.project_point(v, angle_x, angle_y, angle_z, scale, offset_x, offset_y)
-            if proj:
-                projected_points.append((proj, depth))
-            else:
-                projected_points.append((None, 0))
-        
-        # Draw all edges
-        for e in edges:
-            if projected_points[e[0]][0] and projected_points[e[1]][0]:
-                # Get the points
-                p1 = projected_points[e[0]][0]
-                p2 = projected_points[e[1]][0]
-                
-                # Get average depth for edge coloring (closer is brighter)
-                depth = (projected_points[e[0]][1] + projected_points[e[1]][1]) / 2
-                brightness = min(255, int(200 * depth + 55))  # Scale and clamp brightness
-                
-                # Create color with brightness adjustment
-                edge_color = tuple(min(255, int(c * brightness / 255)) for c in color)
-                
-                # Draw the edge
-                cv2.line(frame, p1, p2, edge_color, thickness)
+    def update_object_position(self):
+        """Update object position based on hand tracking"""
+        if len(self.hand_positions) > 0:
+            # Get the first hand position
+            hand_pos = self.hand_positions[0]
+            
+            # If grabbing, move the object
+            if len(self.hand_gestures) > 0 and self.hand_gestures[0]:
+                self.obj_position = [hand_pos[0], hand_pos[1], hand_pos[2]]
+                self.is_grabbing = True
+            elif self.is_grabbing:
+                # Just released, add some velocity for a natural feel
+                self.is_grabbing = False
     
     def run(self):
-        while True:
-            # Capture frame
-            ret, frame = self.cap.read()
-            if not ret:
-                break
+        """Main loop"""
+        running = True
+        
+        while running:
+            # Handle events
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+            
+            try:
+                # Capture webcam frame
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("Failed to capture frame from webcam")
+                    continue
+                    
+                # Mirror the frame horizontally for more intuitive interaction
+                frame = cv2.flip(frame, 1)
                 
-            # Mirror the frame horizontally
-            frame = cv2.flip(frame, 1)
-            
-            # Get frame center
-            center_x = self.width // 2
-            center_y = self.height // 2
-            
-            # Calculate time-based rotation and orbital positions
-            current_time = time.time() - self.start_time
-            
-            # Rotation angles (continuously increasing)
-            self.angle_x = current_time * 0.7
-            self.angle_y = current_time * 1.3
-            self.angle_z = current_time * 0.5
-            
-            # Orbital positioning (objects orbit around center)
-            orbit_radius = 150
-            orbit_speed = 0.5
-            
-            # Cube position
-            cube_orbit = current_time * orbit_speed
-            cube_x = center_x + int(orbit_radius * math.cos(cube_orbit))
-            cube_y = center_y + int(orbit_radius * 0.5 * math.sin(cube_orbit))  # Flatten orbit vertically
-            
-            # Pyramid position - offset by 120 degrees
-            pyramid_orbit = current_time * orbit_speed + (2 * math.pi / 3)
-            pyramid_x = center_x + int(orbit_radius * math.cos(pyramid_orbit))
-            pyramid_y = center_y + int(orbit_radius * 0.5 * math.sin(pyramid_orbit))
-            
-            # Sphere position - offset by 240 degrees
-            sphere_orbit = current_time * orbit_speed + (4 * math.pi / 3)
-            sphere_x = center_x + int(orbit_radius * math.cos(sphere_orbit))
-            sphere_y = center_y + int(orbit_radius * 0.5 * math.sin(sphere_orbit))
-            
-            # Draw objects
-            self.draw_3d_object(frame, self.cube_vertices, self.cube_edges, 
-                               self.angle_x, self.angle_y, self.angle_z, 
-                               self.cube_scale, cube_x, cube_y, self.cube_color)
-            
-            self.draw_3d_object(frame, self.pyramid_vertices, self.pyramid_edges, 
-                               self.angle_x + 0.5, self.angle_y, self.angle_z, 
-                               self.pyramid_scale, pyramid_x, pyramid_y, self.pyramid_color)
-            
-            self.draw_3d_object(frame, self.sphere_vertices, self.sphere_edges, 
-                               self.angle_x, self.angle_y + 0.3, self.angle_z, 
-                               self.sphere_scale, sphere_x, sphere_y, self.sphere_color)
-            
-            # Add text
-            cv2.putText(frame, "OpenCV 3D AR - Press 'Q' to quit", (20, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
-            
-            # Display the frame
-            cv2.imshow('Augmented Reality', frame)
-            
-            # Exit on 'q' key
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+                # Process hands with MediaPipe
+                frame_rgb = self.process_hands(frame)
+                
+                # Update object position based on hand tracking
+                self.update_object_position()
+                
+                # Resize frame to match display dimensions
+                resized_frame = cv2.resize(frame_rgb, (self.display[0], self.display[1]))
+                
+                # Convert to pygame surface
+                pygame_surface = pygame.surfarray.make_surface(resized_frame.swapaxes(0, 1))
+                
+                # Display the pygame surface as background
+                self.screen.blit(pygame_surface, (0, 0))
+                
+                # Calculate time-based rotation
+                current_time = time.time() - self.start_time
+                rotation_speed = 20
+                
+                if not self.is_grabbing:
+                    # Only auto-rotate when not being grabbed
+                    self.obj_rotation = [
+                        (current_time * rotation_speed) % 360,
+                        (current_time * rotation_speed * 0.7) % 360,
+                        (current_time * rotation_speed * 0.5) % 360
+                    ]
+                
+                # Enable 3D rendering
+                glPushMatrix()
+                
+                # Clear depth buffer only (keep color buffer to keep webcam background)
+                glClear(GL_DEPTH_BUFFER_BIT)
+                
+                # Draw 3D objects
+                self.draw_cube(self.obj_position, self.obj_rotation, self.obj_scale)
+                
+                # Restore matrix
+                glPopMatrix()
+                
+                # Update the display
+                pygame.display.flip()
+                
+                # Control frame rate
+                self.clock.tick(30)
+                
+            except Exception as e:
+                print(f"Error in main loop: {str(e)}")
+                continue
         
         # Release resources
         self.cap.release()
-        cv2.destroyAllWindows()
+        self.hands.close()
+        pygame.quit()
+        sys.exit()
 
 if __name__ == "__main__":
-    ar_app = SimpleAR()
-    ar_app.run()
+    try:
+        app = ARHandTracker()
+        app.run()
+    except Exception as e:
+        print(f"Application error: {str(e)}")
+        pygame.quit()
+        sys.exit(1)
