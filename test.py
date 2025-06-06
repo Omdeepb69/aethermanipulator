@@ -51,6 +51,8 @@ class IronManARHandTracker:
         self.hand_positions = []
         self.hand_gestures = []
         self.is_grabbing = False
+        self.last_hand_pos = None
+        self.throw_velocity = [0, 0, 0]
         
         # For hybrid rendering
         self.clock = pygame.time.Clock()
@@ -60,7 +62,13 @@ class IronManARHandTracker:
         self.hud_color = (0, 164, 237)  # Iron Man blue
         self.highlight_color = (255, 140, 0)  # Orange highlight
         
-        # FIX: We'll use a different approach for the webcam background instead of OpenGL textures
+        # Zoom control
+        self.zoom_factor = 1.0
+        self.base_scale = 0.5
+        
+        # Rotation control
+        self.manual_rotation = [0, 0, 0]
+        self.rotation_speed = 0.5
         
     def setup_opengl(self):
         """Set up OpenGL rendering"""
@@ -243,22 +251,8 @@ class IronManARHandTracker:
     
     def draw_hud_elements(self):
         """Draw Iron Man HUD elements"""
-        # Switch to 2D ortho projection for HUD elements
-        glMatrixMode(GL_PROJECTION)
-        glPushMatrix()
-        glLoadIdentity()
-        glOrtho(0, self.display[0], self.display[1], 0, -1, 1)
-        
-        glMatrixMode(GL_MODELVIEW)
-        glPushMatrix()
-        glLoadIdentity()
-        
-        # Disable depth test and lighting for HUD
-        glDisable(GL_DEPTH_TEST)
-        glDisable(GL_LIGHTING)
-        
         # Create text surfaces
-        hud_title = self.hud_font.render("JARVIS AR INTERFACE v1.0.4", True, self.hud_color)
+        hud_title = self.hud_font.render("JARVIS AR INTERFACE v1.0.5", True, self.hud_color)
         
         # Show hand tracking status
         status = "HAND DETECTED: YES" if self.hand_positions else "HAND DETECTED: NO"
@@ -293,16 +287,6 @@ class IronManARHandTracker:
         # Bottom left corner bracket
         pygame.draw.line(self.screen, self.hud_color, (10, self.display[1] - 10), (10, self.display[1] - 50), 1)
         pygame.draw.line(self.screen, self.hud_color, (10, self.display[1] - 10), (100, self.display[1] - 10), 1)
-        
-        # Restore matrices
-        glMatrixMode(GL_PROJECTION)
-        glPopMatrix()
-        glMatrixMode(GL_MODELVIEW)
-        glPopMatrix()
-        
-        # Re-enable depth test and lighting for 3D
-        glEnable(GL_DEPTH_TEST)
-        glEnable(GL_LIGHTING)
     
     def process_hands(self, frame):
         """Process hand landmarks using MediaPipe"""
@@ -361,15 +345,59 @@ class IronManARHandTracker:
     def update_object_position(self):
         """Update object position based on hand tracking"""
         if len(self.hand_positions) > 0:
-            # Get the first hand position
-            hand_pos = self.hand_positions[0]
+            current_hand_pos = self.hand_positions[0]
             
             # If grabbing, move the object
             if len(self.hand_gestures) > 0 and self.hand_gestures[0]:
-                self.obj_position = [hand_pos[0], hand_pos[1], hand_pos[2]]
+                if self.last_hand_pos:
+                    # Calculate velocity for throwing
+                    self.throw_velocity = [
+                        (current_hand_pos[0] - self.last_hand_pos[0]) * 30,
+                        (current_hand_pos[1] - self.last_hand_pos[1]) * 30,
+                        (current_hand_pos[2] - self.last_hand_pos[2]) * 30
+                    ]
+                
+                # Move object to hand position
+                self.obj_position = list(current_hand_pos)
                 self.is_grabbing = True
             else:
+                # If not grabbing but was previously, apply throw velocity
+                if self.is_grabbing:
+                    self.obj_position[0] += self.throw_velocity[0]
+                    self.obj_position[1] += self.throw_velocity[1]
+                    self.obj_position[2] += self.throw_velocity[2]
+                    
+                    # Apply damping to velocity
+                    self.throw_velocity = [v * 0.95 for v in self.throw_velocity]
+                
                 self.is_grabbing = False
+                
+            self.last_hand_pos = current_hand_pos
+        
+        # Handle two-hand zoom gesture
+        if len(self.hand_positions) == 2:
+            # Calculate distance between hands
+            hand1 = self.hand_positions[0]
+            hand2 = self.hand_positions[1]
+            distance = math.sqrt(
+                (hand1[0] - hand2[0])**2 +
+                (hand1[1] - hand2[1])**2 +
+                (hand1[2] - hand2[2])**2
+            )
+            
+            # Map distance to zoom factor (0.5 to 2.0 scale)
+            self.zoom_factor = max(0.5, min(2.0, distance * 2))
+        
+        # Handle one-hand rotation when grabbing
+        if self.is_grabbing and len(self.hand_positions) == 1:
+            if self.last_hand_pos:
+                # Calculate hand movement delta
+                delta_x = self.hand_positions[0][0] - self.last_hand_pos[0]
+                delta_y = self.hand_positions[0][1] - self.last_hand_pos[1]
+                
+                # Update manual rotation based on hand movement
+                self.manual_rotation[1] += delta_x * 100  # Y-axis rotation
+                self.manual_rotation[0] += delta_y * 100  # X-axis rotation
     
     def run(self):
         """Main loop"""
@@ -392,7 +420,6 @@ class IronManARHandTracker:
                     continue
                 
                 # Update the webcam texture as background
-                # FIX: Changed from update_background_texture to process_frame_to_surface
                 pygame_surface = self.process_frame_to_surface(frame)
                 
                 # Update object position based on hand tracking
@@ -413,23 +440,34 @@ class IronManARHandTracker:
                 glLoadIdentity()
                 glTranslatef(0.0, 0.0, -5)
                 
-                # Calculate time-based rotation
+                # Calculate time-based rotation when not being controlled
                 current_time = time.time() - self.start_time
                 rotation_speed = 20
                 
                 if not self.is_grabbing:
                     # Only auto-rotate when not being grabbed
                     self.obj_rotation = [
-                        (current_time * rotation_speed) % 360,
-                        (current_time * rotation_speed * 0.7) % 360,
-                        (current_time * rotation_speed * 0.5) % 360
+                        (current_time * rotation_speed * 0.3) % 360 + self.manual_rotation[0],
+                        (current_time * rotation_speed * 0.7) % 360 + self.manual_rotation[1],
+                        (current_time * rotation_speed * 0.5) % 360 + self.manual_rotation[2]
+                    ]
+                else:
+                    # Use manual rotation when grabbing
+                    self.obj_rotation = [
+                        self.manual_rotation[0],
+                        self.manual_rotation[1],
+                        self.manual_rotation[2]
                     ]
                 
                 # Clear only the depth buffer to draw 3D objects
                 glClear(GL_DEPTH_BUFFER_BIT)
                 
-                # Draw the holographic cube
-                self.draw_holographic_cube(self.obj_position, self.obj_rotation, self.obj_scale)
+                # Draw the holographic cube with current scale
+                self.draw_holographic_cube(
+                    self.obj_position, 
+                    self.obj_rotation, 
+                    self.base_scale * self.zoom_factor
+                )
                 
                 # Draw Iron Man HUD elements
                 self.draw_hud_elements()
